@@ -1,4 +1,5 @@
 import argparse
+from contextlib import contextmanager
 import math
 from pathlib import Path
 
@@ -41,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subset_size", type=positive_int, default=None, help="Optional smoke-test subset size.")
     parser.add_argument("--gradient_accumulation_steps", type=positive_int, default=1)
     parser.add_argument("--learning_rate", type=positive_float, default=1e-4)
+    parser.add_argument("--ema_decay", type=positive_float, default=0.9999, help="EMA decay for saved sampling weights.")
+    parser.add_argument("--disable_ema", action="store_true", help="Disable EMA checkpointing.")
     parser.add_argument("--save_freq", type=non_negative_int, default=1000, help="Checkpoint every N optimizer steps; 0 disables periodic saves.")
     parser.add_argument("--eval_freq", type=non_negative_int, default=1000, help="Preview every N optimizer steps; 0 disables previews.")
     parser.add_argument("--preview_num_samples", type=positive_int, default=4)
@@ -69,11 +72,69 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+class EMAModel:
+    def __init__(self, model: torch.nn.Module, decay: float):
+        if not 0.0 < decay < 1.0:
+            raise ValueError("ema_decay must be in the open interval (0, 1)")
+        self.decay = decay
+        self.shadow_params = [param.detach().clone() for param in self._tracked_params(model)]
+        for param in self.shadow_params:
+            param.requires_grad_(False)
+        self.backup_params: list[torch.Tensor] | None = None
+
+    @staticmethod
+    def _tracked_params(model: torch.nn.Module) -> list[torch.nn.Parameter]:
+        return [param for param in model.parameters() if param.requires_grad]
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        for shadow_param, param in zip(self.shadow_params, self._tracked_params(model), strict=True):
+            shadow_param.lerp_(param.detach(), 1.0 - self.decay)
+
+    @torch.no_grad()
+    def store(self, model: torch.nn.Module) -> None:
+        self.backup_params = [param.detach().clone() for param in self._tracked_params(model)]
+
+    @torch.no_grad()
+    def copy_to(self, model: torch.nn.Module) -> None:
+        for shadow_param, param in zip(self.shadow_params, self._tracked_params(model), strict=True):
+            param.copy_(shadow_param.to(device=param.device, dtype=param.dtype))
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module) -> None:
+        if self.backup_params is None:
+            raise RuntimeError("EMA restore called before store")
+        for backup_param, param in zip(self.backup_params, self._tracked_params(model), strict=True):
+            param.copy_(backup_param.to(device=param.device, dtype=param.dtype))
+        self.backup_params = None
+
+
+@contextmanager
+def use_ema_weights(ema: EMAModel, model: torch.nn.Module):
+    ema.store(model)
+    ema.copy_to(model)
+    try:
+        yield
+    finally:
+        ema.restore(model)
+
+
 def save_checkpoint(unet, checkpoint_dir: Path, step: int | None = None, name: str | None = None) -> Path:
     path = checkpoint_dir / (name if name is not None else f"unet_{step}")
     path.mkdir(parents=True, exist_ok=False)
     unet.save_pretrained(str(path))
     return path
+
+
+def save_ema_checkpoint(
+    ema: EMAModel,
+    unet,
+    checkpoint_dir: Path,
+    step: int | None = None,
+    name: str | None = None,
+) -> Path:
+    with use_ema_weights(ema, unet):
+        return save_checkpoint(unet, checkpoint_dir, step=step, name=name)
 
 
 def main() -> None:
@@ -106,6 +167,9 @@ def main() -> None:
         up_block_types=args.up_block_types,
     ).to(device)
     unet.train()
+    ema = None if args.disable_ema else EMAModel(unet, decay=args.ema_decay)
+    if ema is not None:
+        print(f"EMA enabled with decay {args.ema_decay}")
 
     scheduler = create_scheduler()
     optimizer = torch.optim.AdamW(unet.parameters(), lr=args.learning_rate)
@@ -148,6 +212,8 @@ def main() -> None:
             should_step = accumulation_count == args.gradient_accumulation_steps or is_last_batch
             if should_step:
                 optimizer.step()
+                if ema is not None:
+                    ema.update(unet)
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 progress.update(1)
@@ -158,20 +224,38 @@ def main() -> None:
                 if args.save_freq and global_step % args.save_freq == 0:
                     path = save_checkpoint(unet, checkpoint_dir, global_step)
                     print(f"Saved checkpoint: {path}")
+                    if ema is not None:
+                        ema_path = save_ema_checkpoint(ema, unet, checkpoint_dir, name=f"unet_{global_step}_ema")
+                        print(f"Saved EMA checkpoint: {ema_path}")
                 if args.eval_freq and global_step % args.eval_freq == 0:
                     preview_dir = sample_dir / f"step_{global_step:06d}"
-                    sample_to_pngs(
-                        unet=unet,
-                        vae=vae,
-                        scheduler=create_scheduler(),
-                        output_dir=preview_dir,
-                        num_samples=args.preview_num_samples,
-                        batch_size=args.preview_batch_size,
-                        num_inference_steps=args.preview_inference_steps,
-                        device=device,
-                        seed=args.seed + global_step,
-                        show_progress=False,
-                    )
+                    if ema is None:
+                        sample_to_pngs(
+                            unet=unet,
+                            vae=vae,
+                            scheduler=create_scheduler(),
+                            output_dir=preview_dir,
+                            num_samples=args.preview_num_samples,
+                            batch_size=args.preview_batch_size,
+                            num_inference_steps=args.preview_inference_steps,
+                            device=device,
+                            seed=args.seed + global_step,
+                            show_progress=False,
+                        )
+                    else:
+                        with use_ema_weights(ema, unet):
+                            sample_to_pngs(
+                                unet=unet,
+                                vae=vae,
+                                scheduler=create_scheduler(),
+                                output_dir=preview_dir,
+                                num_samples=args.preview_num_samples,
+                                batch_size=args.preview_batch_size,
+                                num_inference_steps=args.preview_inference_steps,
+                                device=device,
+                                seed=args.seed + global_step,
+                                show_progress=False,
+                            )
                     unet.train()
 
                 if global_step >= total_updates:
@@ -182,6 +266,9 @@ def main() -> None:
     progress.close()
     final_path = save_checkpoint(unet, checkpoint_dir, name="unet_final")
     print(f"Saved final checkpoint: {final_path}")
+    if ema is not None:
+        ema_final_path = save_ema_checkpoint(ema, unet, checkpoint_dir, name="unet_final_ema")
+        print(f"Saved final EMA checkpoint: {ema_final_path}")
 
 
 if __name__ == "__main__":
