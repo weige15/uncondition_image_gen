@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subset_size", type=positive_int, default=None, help="Optional smoke-test subset size.")
     parser.add_argument("--gradient_accumulation_steps", type=positive_int, default=1)
     parser.add_argument("--learning_rate", type=positive_float, default=1e-4)
+    parser.add_argument("--loss_weighting", choices=("none", "min_snr"), default="none")
+    parser.add_argument("--min_snr_gamma", type=positive_float, default=5.0)
     parser.add_argument("--ema_decay", type=positive_float, default=0.9999, help="EMA decay for saved sampling weights.")
     parser.add_argument("--disable_ema", action="store_true", help="Disable EMA checkpointing.")
     parser.add_argument("--save_freq", type=non_negative_int, default=1000, help="Checkpoint every N optimizer steps; 0 disables periodic saves.")
@@ -137,6 +139,25 @@ def save_ema_checkpoint(
         return save_checkpoint(unet, checkpoint_dir, step=step, name=name)
 
 
+def compute_loss(
+    noise_pred: torch.Tensor,
+    noise: torch.Tensor,
+    timesteps: torch.Tensor,
+    scheduler,
+    loss_weighting: str,
+    min_snr_gamma: float,
+) -> torch.Tensor:
+    if loss_weighting == "none":
+        return F.mse_loss(noise_pred, noise)
+
+    per_sample_loss = F.mse_loss(noise_pred, noise, reduction="none").mean(dim=(1, 2, 3))
+    alphas_cumprod = scheduler.alphas_cumprod.to(device=timesteps.device, dtype=torch.float32)
+    alpha = alphas_cumprod[timesteps]
+    snr = alpha / (1.0 - alpha).clamp_min(1e-8)
+    weights = torch.minimum(snr, torch.full_like(snr, min_snr_gamma)) / snr.clamp_min(1e-8)
+    return (per_sample_loss * weights).mean()
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -170,6 +191,8 @@ def main() -> None:
     ema = None if args.disable_ema else EMAModel(unet, decay=args.ema_decay)
     if ema is not None:
         print(f"EMA enabled with decay {args.ema_decay}")
+    if args.loss_weighting == "min_snr":
+        print(f"Min-SNR loss weighting enabled with gamma {args.min_snr_gamma}")
 
     scheduler = create_scheduler()
     optimizer = torch.optim.AdamW(unet.parameters(), lr=args.learning_rate)
@@ -199,7 +222,14 @@ def main() -> None:
             )
             noisy_latents = scheduler.add_noise(latents, noise, timesteps)
             noise_pred = unet(noisy_latents, timesteps).sample
-            loss = F.mse_loss(noise_pred, noise)
+            loss = compute_loss(
+                noise_pred=noise_pred,
+                noise=noise,
+                timesteps=timesteps,
+                scheduler=scheduler,
+                loss_weighting=args.loss_weighting,
+                min_snr_gamma=args.min_snr_gamma,
+            )
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite loss at epoch {epoch}, step {global_step}: {loss.item()}")
 
