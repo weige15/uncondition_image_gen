@@ -8,14 +8,18 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from common import (
+    CLASS_NAMES,
     DEFAULT_BLOCK_CHANNELS,
     DEFAULT_DOWN_BLOCKS,
     DEFAULT_UP_BLOCKS,
     IMAGE_SIZE,
+    MULTI_ATTN_DOWN_BLOCKS,
+    MULTI_ATTN_UP_BLOCKS,
     build_unet,
     create_scheduler,
     encode_images,
     load_vae,
+    make_class_label_sequence,
     make_dataloader,
     non_negative_int,
     parse_int_tuple,
@@ -42,6 +46,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subset_size", type=positive_int, default=None, help="Optional smoke-test subset size.")
     parser.add_argument("--gradient_accumulation_steps", type=positive_int, default=1)
     parser.add_argument("--learning_rate", type=positive_float, default=1e-4)
+    parser.add_argument(
+        "--latent_mode",
+        choices=("sample", "mode"),
+        default="sample",
+        help="Use sampled VAE latents or deterministic posterior modes during training.",
+    )
+    parser.add_argument(
+        "--class_conditioning",
+        action="store_true",
+        help="Condition the U-Net on labels inferred from filename prefixes: ntu, nccu, nycu.",
+    )
     parser.add_argument("--loss_weighting", choices=("none", "min_snr"), default="none")
     parser.add_argument("--min_snr_gamma", type=positive_float, default=5.0)
     parser.add_argument("--ema_decay", type=positive_float, default=0.9999, help="EMA decay for saved sampling weights.")
@@ -53,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview_inference_steps", type=positive_int, default=50)
     parser.add_argument("--sample_size", type=positive_int, default=32)
     parser.add_argument("--layers_per_block", type=positive_int, default=2)
+    parser.add_argument(
+        "--architecture_preset",
+        choices=("custom", "default", "multi_attn"),
+        default="custom",
+        help="Use 'multi_attn' for attention at both 16x16 and 8x8 latent resolutions.",
+    )
     parser.add_argument(
         "--block_out_channels",
         type=parse_int_tuple,
@@ -176,16 +197,27 @@ def main() -> None:
         num_workers=args.num_workers,
         subset_size=args.subset_size,
         seed=args.seed,
+        return_labels=args.class_conditioning,
     )
     print(f"Loaded {len(dataloader.dataset)} images at {IMAGE_SIZE}x{IMAGE_SIZE}")
 
     vae = load_vae(device)
+    down_block_types = args.down_block_types
+    up_block_types = args.up_block_types
+    if args.architecture_preset == "default":
+        down_block_types = DEFAULT_DOWN_BLOCKS
+        up_block_types = DEFAULT_UP_BLOCKS
+    elif args.architecture_preset == "multi_attn":
+        down_block_types = MULTI_ATTN_DOWN_BLOCKS
+        up_block_types = MULTI_ATTN_UP_BLOCKS
+
     unet = build_unet(
         sample_size=args.sample_size,
         block_out_channels=args.block_out_channels,
         layers_per_block=args.layers_per_block,
-        down_block_types=args.down_block_types,
-        up_block_types=args.up_block_types,
+        down_block_types=down_block_types,
+        up_block_types=up_block_types,
+        num_class_embeds=len(CLASS_NAMES) if args.class_conditioning else None,
     ).to(device)
     unet.train()
     ema = None if args.disable_ema else EMAModel(unet, decay=args.ema_decay)
@@ -193,6 +225,12 @@ def main() -> None:
         print(f"EMA enabled with decay {args.ema_decay}")
     if args.loss_weighting == "min_snr":
         print(f"Min-SNR loss weighting enabled with gamma {args.min_snr_gamma}")
+    if args.latent_mode == "mode":
+        print("Training on deterministic VAE posterior modes")
+    if args.class_conditioning:
+        print(f"Class conditioning enabled for labels: {', '.join(CLASS_NAMES)}")
+    if args.architecture_preset != "custom":
+        print(f"Architecture preset: {args.architecture_preset}")
 
     scheduler = create_scheduler()
     optimizer = torch.optim.AdamW(unet.parameters(), lr=args.learning_rate)
@@ -210,8 +248,14 @@ def main() -> None:
             if global_step >= total_updates:
                 break
 
-            pixel_values = batch.to(device, non_blocking=True)
-            latents = encode_images(vae, pixel_values)
+            if args.class_conditioning:
+                pixel_values, class_labels = batch
+                class_labels = class_labels.to(device, non_blocking=True)
+            else:
+                pixel_values = batch
+                class_labels = None
+            pixel_values = pixel_values.to(device, non_blocking=True)
+            latents = encode_images(vae, pixel_values, latent_mode=args.latent_mode)
             noise = torch.randn_like(latents)
             timesteps = torch.randint(
                 0,
@@ -221,7 +265,7 @@ def main() -> None:
                 dtype=torch.long,
             )
             noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-            noise_pred = unet(noisy_latents, timesteps).sample
+            noise_pred = unet(noisy_latents, timesteps, class_labels=class_labels).sample
             loss = compute_loss(
                 noise_pred=noise_pred,
                 noise=noise,
@@ -259,6 +303,14 @@ def main() -> None:
                         print(f"Saved EMA checkpoint: {ema_path}")
                 if args.eval_freq and global_step % args.eval_freq == 0:
                     preview_dir = sample_dir / f"step_{global_step:06d}"
+                    preview_class_labels = None
+                    if args.class_conditioning:
+                        preview_class_labels = make_class_label_sequence(
+                            num_samples=args.preview_num_samples,
+                            mode="train_prior",
+                            seed=args.seed + global_step,
+                            device=device,
+                        )
                     if ema is None:
                         sample_to_pngs(
                             unet=unet,
@@ -270,6 +322,7 @@ def main() -> None:
                             num_inference_steps=args.preview_inference_steps,
                             device=device,
                             seed=args.seed + global_step,
+                            class_labels=preview_class_labels,
                             show_progress=False,
                         )
                     else:
@@ -284,6 +337,7 @@ def main() -> None:
                                 num_inference_steps=args.preview_inference_steps,
                                 device=device,
                                 seed=args.seed + global_step,
+                                class_labels=preview_class_labels,
                                 show_progress=False,
                             )
                     unet.train()

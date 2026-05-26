@@ -29,6 +29,11 @@ SCHEDULER_KWARGS = {
 DEFAULT_BLOCK_CHANNELS = (64, 128, 256, 256)
 DEFAULT_DOWN_BLOCKS = ("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D")
 DEFAULT_UP_BLOCKS = ("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D")
+MULTI_ATTN_DOWN_BLOCKS = ("DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D", "DownBlock2D")
+MULTI_ATTN_UP_BLOCKS = ("UpBlock2D", "AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D")
+CLASS_NAMES = ("ntu", "nccu", "nycu")
+CLASS_TO_LABEL = {name: index for index, name in enumerate(CLASS_NAMES)}
+CLASS_PRIOR = (3118 / 5500, 1275 / 5500, 1107 / 5500)
 
 
 def positive_int(value: str) -> int:
@@ -116,17 +121,20 @@ def fail_if_output_pngs_exist(output_dir: Path) -> None:
 
 
 class ProfessorFaceDataset(Dataset):
-    def __init__(self, image_dir: Path, image_size: int = IMAGE_SIZE):
+    def __init__(self, image_dir: Path, image_size: int = IMAGE_SIZE, return_labels: bool = False):
         self.image_dir = require_directory(Path(image_dir), "image_dir")
         self.image_size = image_size
+        self.return_labels = return_labels
         self.image_paths = list_pngs(self.image_dir)
         if not self.image_paths:
             raise FileNotFoundError(f"No PNG files found in {self.image_dir}")
+        if self.return_labels:
+            self.labels = [label_from_path(path) for path in self.image_paths]
 
     def __len__(self) -> int:
         return len(self.image_paths)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int):
         path = self.image_paths[idx]
         try:
             with Image.open(path) as image:
@@ -135,7 +143,17 @@ class ProfessorFaceDataset(Dataset):
         except Exception as exc:
             raise RuntimeError(f"Failed to read image {path}") from exc
         tensor = torch.from_numpy(array).permute(2, 0, 1).contiguous()
-        return tensor.mul(2.0).sub(1.0)
+        tensor = tensor.mul(2.0).sub(1.0)
+        if self.return_labels:
+            return tensor, torch.tensor(self.labels[idx], dtype=torch.long)
+        return tensor
+
+
+def label_from_path(path: Path) -> int:
+    prefix = Path(path).stem.split("_", maxsplit=1)[0]
+    if prefix not in CLASS_TO_LABEL:
+        raise ValueError(f"Could not infer class label from filename: {path}")
+    return CLASS_TO_LABEL[prefix]
 
 
 def make_dataloader(
@@ -145,8 +163,9 @@ def make_dataloader(
     num_workers: int,
     subset_size: int | None = None,
     seed: int | None = None,
+    return_labels: bool = False,
 ) -> DataLoader:
-    dataset: Dataset = ProfessorFaceDataset(image_dir)
+    dataset: Dataset = ProfessorFaceDataset(image_dir, return_labels=return_labels)
     if subset_size is not None:
         if subset_size <= 0:
             raise ValueError("subset_size must be positive when provided")
@@ -174,8 +193,14 @@ def load_vae(device: torch.device):
 
 
 @torch.no_grad()
-def encode_images(vae, pixel_values: torch.Tensor) -> torch.Tensor:
-    latents = vae.encode(pixel_values).latent_dist.sample()
+def encode_images(vae, pixel_values: torch.Tensor, latent_mode: str = "sample") -> torch.Tensor:
+    latent_dist = vae.encode(pixel_values).latent_dist
+    if latent_mode == "sample":
+        latents = latent_dist.sample()
+    elif latent_mode == "mode":
+        latents = latent_dist.mode()
+    else:
+        raise ValueError(f"Unsupported latent_mode: {latent_mode}")
     latents = latents * vae.config.scaling_factor
     if latents.ndim != 4 or latents.shape[1] != LATENT_CHANNELS:
         raise RuntimeError(f"Unexpected VAE latent shape: {tuple(latents.shape)}")
@@ -188,10 +213,55 @@ def decode_latents(vae, latents: torch.Tensor) -> torch.Tensor:
     return decoded.clamp(-1, 1).add(1.0).div(2.0)
 
 
-def create_scheduler():
-    from diffusers import DDPMScheduler
+def create_scheduler(scheduler_type: str = "ddpm"):
+    if scheduler_type == "ddpm":
+        from diffusers import DDPMScheduler
 
-    return DDPMScheduler(**SCHEDULER_KWARGS)
+        return DDPMScheduler(**SCHEDULER_KWARGS)
+    if scheduler_type == "ddim":
+        from diffusers import DDIMScheduler
+
+        return DDIMScheduler(**SCHEDULER_KWARGS)
+    if scheduler_type == "dpm_solver":
+        from diffusers import DPMSolverMultistepScheduler
+
+        kwargs = {key: value for key, value in SCHEDULER_KWARGS.items() if key != "clip_sample"}
+        return DPMSolverMultistepScheduler(**kwargs)
+    raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
+
+
+def make_class_label_sequence(
+    num_samples: int,
+    mode: str,
+    seed: int,
+    device: torch.device | None = None,
+    class_name: str | None = None,
+) -> torch.Tensor | None:
+    if mode == "none":
+        return None
+    if class_name is not None:
+        if class_name not in CLASS_TO_LABEL:
+            raise ValueError(f"Unknown class label {class_name}. Expected one of {CLASS_NAMES}")
+        labels = torch.full((num_samples,), CLASS_TO_LABEL[class_name], dtype=torch.long)
+    elif mode == "uniform":
+        labels = torch.arange(num_samples, dtype=torch.long) % len(CLASS_NAMES)
+    elif mode == "train_prior":
+        raw_counts = [prior * num_samples for prior in CLASS_PRIOR]
+        counts = [int(count) for count in raw_counts]
+        for index in np.argsort([count - int(count) for count in raw_counts])[::-1][: num_samples - sum(counts)]:
+            counts[int(index)] += 1
+        labels = torch.cat(
+            [torch.full((count,), label, dtype=torch.long) for label, count in enumerate(counts)]
+        )
+    else:
+        raise ValueError(f"Unsupported class sampling mode: {mode}")
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    labels = labels[torch.randperm(labels.shape[0], generator=generator)]
+    if device is not None:
+        labels = labels.to(device)
+    return labels
 
 
 def build_unet(
@@ -200,6 +270,7 @@ def build_unet(
     layers_per_block: int = 2,
     down_block_types: Sequence[str] = DEFAULT_DOWN_BLOCKS,
     up_block_types: Sequence[str] = DEFAULT_UP_BLOCKS,
+    num_class_embeds: int | None = None,
 ):
     from diffusers import UNet2DModel
 
@@ -213,6 +284,7 @@ def build_unet(
         block_out_channels=tuple(block_out_channels),
         down_block_types=tuple(down_block_types),
         up_block_types=tuple(up_block_types),
+        num_class_embeds=num_class_embeds,
     )
 
 

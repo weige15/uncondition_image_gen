@@ -2,11 +2,13 @@ import argparse
 from pathlib import Path
 
 from common import (
+    CLASS_NAMES,
     FINAL_SAMPLE_COUNT,
     create_scheduler,
     fail_if_output_pngs_exist,
     load_unet_checkpoint,
     load_vae,
+    make_class_label_sequence,
     positive_int,
     resolve_device,
     set_seed,
@@ -22,8 +24,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_samples", type=positive_int, default=FINAL_SAMPLE_COUNT)
     parser.add_argument("--batch_size", type=positive_int, default=32)
     parser.add_argument("--num_inference_steps", type=positive_int, default=1000)
+    parser.add_argument("--scheduler", choices=("ddpm", "ddim", "dpm_solver"), default="ddpm")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--class_sampling",
+        choices=("none", "train_prior", "uniform"),
+        default="train_prior",
+        help="Class-label schedule for class-conditional checkpoints; ignored by unconditional checkpoints.",
+    )
+    parser.add_argument(
+        "--class_label",
+        choices=CLASS_NAMES,
+        default=None,
+        help="Generate only one class for class-conditional checkpoints.",
+    )
     parser.add_argument(
         "--allow_smoke_count",
         action="store_true",
@@ -56,7 +71,21 @@ def main() -> None:
 
     vae = load_vae(device)
     unet = load_unet_checkpoint(args.checkpoint_dir, device)
-    scheduler = create_scheduler()
+    scheduler = create_scheduler(args.scheduler)
+    num_class_embeds = getattr(unet.config, "num_class_embeds", None)
+    class_labels = None
+    if num_class_embeds:
+        class_labels = make_class_label_sequence(
+            num_samples=args.num_samples,
+            mode=args.class_sampling,
+            seed=args.seed,
+            device=device,
+            class_name=args.class_label,
+        )
+        if class_labels is None:
+            raise ValueError("This checkpoint is class-conditional; use --class_sampling train_prior/uniform or --class_label.")
+    elif args.class_label is not None or args.class_sampling != "train_prior":
+        print("Ignoring class sampling options because the checkpoint is unconditional.")
 
     written = sample_to_pngs(
         unet=unet,
@@ -68,6 +97,7 @@ def main() -> None:
         num_inference_steps=args.num_inference_steps,
         device=device,
         seed=args.seed,
+        class_labels=class_labels,
     )
     if args.num_samples == FINAL_SAMPLE_COUNT:
         validate_png_directory(args.output_dir)
