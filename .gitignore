@@ -40,3 +40,4 @@ tensorboard/
 hw5_[0-9]*/
 *.ipynb
 results_ema_big_*/
+results_*/

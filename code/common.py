@@ -226,7 +226,13 @@ def create_scheduler(scheduler_type: str = "ddpm"):
         from diffusers import DPMSolverMultistepScheduler
 
         kwargs = {key: value for key, value in SCHEDULER_KWARGS.items() if key != "clip_sample"}
-        return DPMSolverMultistepScheduler(**kwargs)
+        return DPMSolverMultistepScheduler(
+            **kwargs,
+            algorithm_type="dpmsolver",
+            solver_order=2,
+            lower_order_final=True,
+            final_sigmas_type="sigma_min",
+        )
     raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
 
 

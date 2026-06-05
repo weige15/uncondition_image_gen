@@ -59,6 +59,11 @@ def main() -> None:
             f"--num_samples defaults to {FINAL_SAMPLE_COUNT}. "
             "Pass --allow_smoke_count for small smoke-test generations."
         )
+    if args.scheduler == "dpm_solver" and args.num_inference_steps > 300:
+        raise ValueError(
+            "DPM-Solver should be run with a low step count for this epsilon-prediction checkpoint. "
+            "Use one --num_inference_steps flag, typically 50, 100, or 250."
+        )
 
     set_seed(args.seed)
     device = resolve_device(args.device)
