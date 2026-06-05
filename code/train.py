@@ -47,6 +47,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient_accumulation_steps", type=positive_int, default=1)
     parser.add_argument("--learning_rate", type=positive_float, default=1e-4)
     parser.add_argument(
+        "--lr_scheduler",
+        choices=("constant", "cosine"),
+        default="constant",
+        help="Optimizer-step learning-rate schedule. Cosine is intended for longer runs.",
+    )
+    parser.add_argument(
+        "--lr_warmup_steps",
+        type=non_negative_int,
+        default=0,
+        help="Linearly warm up the learning rate over this many optimizer steps.",
+    )
+    parser.add_argument(
+        "--lr_min_factor",
+        type=positive_float,
+        default=0.1,
+        help="Final LR as a fraction of --learning_rate for cosine scheduling.",
+    )
+    parser.add_argument(
         "--latent_mode",
         choices=("sample", "mode"),
         default="sample",
@@ -179,6 +197,32 @@ def compute_loss(
     return (per_sample_loss * weights).mean()
 
 
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    scheduler_type: str,
+    total_updates: int,
+    warmup_steps: int,
+    min_factor: float,
+):
+    if not 0.0 < min_factor <= 1.0:
+        raise ValueError("--lr_min_factor must be in the interval (0, 1]")
+    if warmup_steps >= total_updates:
+        raise ValueError("--lr_warmup_steps must be smaller than the total optimizer-step count")
+
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return max((step + 1) / warmup_steps, 1e-8)
+        if scheduler_type == "constant":
+            return 1.0
+
+        decay_steps = max(1, total_updates - warmup_steps)
+        decay_progress = min(max(step - warmup_steps, 0), decay_steps) / decay_steps
+        cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -234,10 +278,23 @@ def main() -> None:
 
     scheduler = create_scheduler()
     optimizer = torch.optim.AdamW(unet.parameters(), lr=args.learning_rate)
-    optimizer.zero_grad(set_to_none=True)
 
     updates_per_epoch = math.ceil(len(dataloader) / args.gradient_accumulation_steps)
     total_updates = args.max_train_steps or (args.epochs * updates_per_epoch)
+    lr_scheduler = build_lr_scheduler(
+        optimizer=optimizer,
+        scheduler_type=args.lr_scheduler,
+        total_updates=total_updates,
+        warmup_steps=args.lr_warmup_steps,
+        min_factor=args.lr_min_factor,
+    )
+    if args.lr_scheduler == "cosine" or args.lr_warmup_steps:
+        print(
+            "LR schedule: "
+            f"{args.lr_scheduler}, warmup_steps={args.lr_warmup_steps}, min_factor={args.lr_min_factor}"
+        )
+    optimizer.zero_grad(set_to_none=True)
+
     global_step = 0
     accumulation_count = 0
     running_loss = 0.0
@@ -286,12 +343,14 @@ def main() -> None:
             should_step = accumulation_count == args.gradient_accumulation_steps or is_last_batch
             if should_step:
                 optimizer.step()
+                lr_scheduler.step()
                 if ema is not None:
                     ema.update(unet)
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 progress.update(1)
-                progress.set_postfix(loss=f"{running_loss / accumulation_count:.4f}")
+                current_lr = optimizer.param_groups[0]["lr"]
+                progress.set_postfix(loss=f"{running_loss / accumulation_count:.4f}", lr=f"{current_lr:.2e}")
                 accumulation_count = 0
                 running_loss = 0.0
 
