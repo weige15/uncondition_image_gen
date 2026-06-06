@@ -24,7 +24,6 @@ def sample_to_pngs(
     unet_was_training = unet.training
     unet.eval()
     vae.eval()
-    scheduler.set_timesteps(num_inference_steps)
     if class_labels is not None and class_labels.shape[0] != num_samples:
         raise ValueError(f"class_labels must have {num_samples} entries, got {class_labels.shape[0]}")
 
@@ -38,6 +37,7 @@ def sample_to_pngs(
 
     for _ in iterator:
         current_batch = min(batch_size, num_samples - written)
+        scheduler.set_timesteps(num_inference_steps)
         batch_class_labels = None
         if class_labels is not None:
             batch_class_labels = class_labels[written : written + current_batch].to(device)
