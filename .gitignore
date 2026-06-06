@@ -24,6 +24,7 @@ validation_input/
 validation_output/
 runs/
 wandb/
+public_data/
 tensorboard/
 
 # Model checkpoints and large generated artifacts
@@ -41,3 +42,4 @@ hw5_[0-9]*/
 *.ipynb
 results_ema_big_*/
 results_*/
+
