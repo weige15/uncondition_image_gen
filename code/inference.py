@@ -4,11 +4,15 @@ from pathlib import Path
 from common import (
     CLASS_NAMES,
     FINAL_SAMPLE_COUNT,
+    NULL_CLASS_LABEL,
     create_scheduler,
     fail_if_output_pngs_exist,
     load_unet_checkpoint,
     load_vae,
     make_class_label_sequence,
+    make_class_label_sequence_from_counts,
+    parse_non_negative_int_tuple,
+    positive_float,
     positive_int,
     resolve_device,
     set_seed,
@@ -28,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument(
+        "--initial_noise_scale",
+        type=positive_float,
+        default=1.0,
+        help="Scale the starting Gaussian latent noise. Keep 1.0 unless doing a controlled FID sweep.",
+    )
+    parser.add_argument(
         "--class_sampling",
         choices=("none", "train_prior", "uniform"),
         default="train_prior",
@@ -38,6 +48,18 @@ def parse_args() -> argparse.Namespace:
         choices=CLASS_NAMES,
         default=None,
         help="Generate only one class for class-conditional checkpoints.",
+    )
+    parser.add_argument(
+        "--class_counts",
+        type=parse_non_negative_int_tuple,
+        default=None,
+        help="Explicit comma-separated counts for ntu,nccu,nycu. Overrides --class_sampling and --class_label.",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=positive_float,
+        default=1.0,
+        help="Classifier-free guidance scale for checkpoints trained with --class_dropout_prob.",
     )
     parser.add_argument(
         "--allow_smoke_count",
@@ -64,6 +86,11 @@ def main() -> None:
             "DPM-Solver should be run with a low step count for this epsilon-prediction checkpoint. "
             "Use one --num_inference_steps flag, typically 50, 100, or 250."
         )
+    if args.class_counts is not None:
+        if len(args.class_counts) != len(CLASS_NAMES):
+            raise ValueError(f"--class_counts must contain {len(CLASS_NAMES)} values for {','.join(CLASS_NAMES)}")
+        if sum(args.class_counts) != args.num_samples:
+            raise ValueError(f"--class_counts must sum to --num_samples ({args.num_samples})")
 
     set_seed(args.seed)
     device = resolve_device(args.device)
@@ -79,18 +106,33 @@ def main() -> None:
     scheduler = create_scheduler(args.scheduler)
     num_class_embeds = getattr(unet.config, "num_class_embeds", None)
     class_labels = None
+    null_class_label = None
     if num_class_embeds:
-        class_labels = make_class_label_sequence(
-            num_samples=args.num_samples,
-            mode=args.class_sampling,
-            seed=args.seed,
-            device=device,
-            class_name=args.class_label,
-        )
+        if args.class_counts is not None:
+            class_labels = make_class_label_sequence_from_counts(args.class_counts, seed=args.seed, device=device)
+        else:
+            class_labels = make_class_label_sequence(
+                num_samples=args.num_samples,
+                mode=args.class_sampling,
+                seed=args.seed,
+                device=device,
+                class_name=args.class_label,
+            )
         if class_labels is None:
             raise ValueError("This checkpoint is class-conditional; use --class_sampling train_prior/uniform or --class_label.")
+        if args.guidance_scale != 1.0:
+            if num_class_embeds <= len(CLASS_NAMES):
+                raise ValueError(
+                    "--guidance_scale requires a checkpoint trained with --class_dropout_prob "
+                    f"so it has a null class embedding; this checkpoint has {num_class_embeds} class embeddings."
+                )
+            null_class_label = NULL_CLASS_LABEL
     elif args.class_label is not None or args.class_sampling != "train_prior":
         print("Ignoring class sampling options because the checkpoint is unconditional.")
+    if not num_class_embeds and args.class_counts is not None:
+        print("Ignoring --class_counts because the checkpoint is unconditional.")
+    if not num_class_embeds and args.guidance_scale != 1.0:
+        raise ValueError("--guidance_scale requires a class-conditional checkpoint with a null class embedding.")
 
     written = sample_to_pngs(
         unet=unet,
@@ -103,6 +145,9 @@ def main() -> None:
         device=device,
         seed=args.seed,
         class_labels=class_labels,
+        guidance_scale=args.guidance_scale,
+        null_class_label=null_class_label,
+        initial_noise_scale=args.initial_noise_scale,
     )
     if args.num_samples == FINAL_SAMPLE_COUNT:
         validate_png_directory(args.output_dir)

@@ -33,6 +33,7 @@ MULTI_ATTN_DOWN_BLOCKS = ("DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D", "
 MULTI_ATTN_UP_BLOCKS = ("UpBlock2D", "AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D")
 CLASS_NAMES = ("ntu", "nccu", "nycu")
 CLASS_TO_LABEL = {name: index for index, name in enumerate(CLASS_NAMES)}
+NULL_CLASS_LABEL = len(CLASS_NAMES)
 CLASS_PRIOR = (3118 / 5500, 1275 / 5500, 1107 / 5500)
 
 
@@ -57,6 +58,13 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
 def parse_int_tuple(value: str) -> tuple[int, ...]:
     try:
         parsed = tuple(int(item.strip()) for item in value.split(",") if item.strip())
@@ -64,6 +72,16 @@ def parse_int_tuple(value: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError("expected comma-separated integers") from exc
     if not parsed or any(item <= 0 for item in parsed):
         raise argparse.ArgumentTypeError("all tuple values must be positive integers")
+    return parsed
+
+
+def parse_non_negative_int_tuple(value: str) -> tuple[int, ...]:
+    try:
+        parsed = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected comma-separated integers") from exc
+    if not parsed or any(item < 0 for item in parsed):
+        raise argparse.ArgumentTypeError("all tuple values must be non-negative integers")
     return parsed
 
 
@@ -261,6 +279,28 @@ def make_class_label_sequence(
     else:
         raise ValueError(f"Unsupported class sampling mode: {mode}")
 
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    labels = labels[torch.randperm(labels.shape[0], generator=generator)]
+    if device is not None:
+        labels = labels.to(device)
+    return labels
+
+
+def make_class_label_sequence_from_counts(
+    counts: Sequence[int],
+    seed: int,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    if len(counts) != len(CLASS_NAMES):
+        raise ValueError(f"Expected {len(CLASS_NAMES)} class counts, got {len(counts)}")
+    if any(count < 0 for count in counts):
+        raise ValueError("Class counts must be non-negative")
+    if sum(counts) <= 0:
+        raise ValueError("At least one class count must be positive")
+    labels = torch.cat(
+        [torch.full((count,), label, dtype=torch.long) for label, count in enumerate(counts) if count > 0]
+    )
     generator = torch.Generator()
     generator.manual_seed(seed)
     labels = labels[torch.randperm(labels.shape[0], generator=generator)]

@@ -19,6 +19,9 @@ def sample_to_pngs(
     seed: int,
     start_index: int = 0,
     class_labels: torch.Tensor | None = None,
+    guidance_scale: float = 1.0,
+    null_class_label: int | None = None,
+    initial_noise_scale: float = 1.0,
     show_progress: bool = True,
 ) -> int:
     unet_was_training = unet.training
@@ -26,6 +29,8 @@ def sample_to_pngs(
     vae.eval()
     if class_labels is not None and class_labels.shape[0] != num_samples:
         raise ValueError(f"class_labels must have {num_samples} entries, got {class_labels.shape[0]}")
+    if guidance_scale != 1.0 and (class_labels is None or null_class_label is None):
+        raise ValueError("guidance_scale requires class_labels and null_class_label")
 
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
@@ -46,8 +51,26 @@ def sample_to_pngs(
             generator=generator,
             device=device,
         )
+        if initial_noise_scale != 1.0:
+            latents = latents * initial_noise_scale
         for timestep in scheduler.timesteps:
-            noise_pred = unet(latents, timestep, class_labels=batch_class_labels).sample
+            if guidance_scale == 1.0:
+                noise_pred = unet(latents, timestep, class_labels=batch_class_labels).sample
+            else:
+                model_input = torch.cat([latents, latents], dim=0)
+                model_class_labels = torch.cat(
+                    [
+                        torch.full((current_batch,), null_class_label, dtype=torch.long, device=device),
+                        batch_class_labels,
+                    ],
+                    dim=0,
+                )
+                noise_uncond, noise_cond = unet(
+                    model_input,
+                    timestep,
+                    class_labels=model_class_labels,
+                ).sample.chunk(2)
+                noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
             assert_finite_tensor(noise_pred, "predicted noise")
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
             assert_finite_tensor(latents, "sampled latents")

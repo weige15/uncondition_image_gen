@@ -15,6 +15,7 @@ from common import (
     IMAGE_SIZE,
     MULTI_ATTN_DOWN_BLOCKS,
     MULTI_ATTN_UP_BLOCKS,
+    NULL_CLASS_LABEL,
     build_unet,
     create_scheduler,
     encode_images,
@@ -22,6 +23,7 @@ from common import (
     make_class_label_sequence,
     make_dataloader,
     non_negative_int,
+    non_negative_float,
     parse_int_tuple,
     parse_str_tuple,
     positive_float,
@@ -74,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         "--class_conditioning",
         action="store_true",
         help="Condition the U-Net on labels inferred from filename prefixes: ntu, nccu, nycu.",
+    )
+    parser.add_argument(
+        "--class_dropout_prob",
+        type=non_negative_float,
+        default=0.0,
+        help="Drop class labels to a learned null class during class-conditional training for CFG.",
     )
     parser.add_argument("--loss_weighting", choices=("none", "min_snr"), default="none")
     parser.add_argument("--min_snr_gamma", type=positive_float, default=5.0)
@@ -225,6 +233,10 @@ def build_lr_scheduler(
 
 def main() -> None:
     args = parse_args()
+    if args.class_dropout_prob >= 1.0:
+        raise ValueError("--class_dropout_prob must be smaller than 1")
+    if args.class_dropout_prob > 0 and not args.class_conditioning:
+        raise ValueError("--class_dropout_prob requires --class_conditioning")
     set_seed(args.seed)
     device = resolve_device(args.device)
 
@@ -261,7 +273,9 @@ def main() -> None:
         layers_per_block=args.layers_per_block,
         down_block_types=down_block_types,
         up_block_types=up_block_types,
-        num_class_embeds=len(CLASS_NAMES) if args.class_conditioning else None,
+        num_class_embeds=(len(CLASS_NAMES) + (1 if args.class_dropout_prob > 0 else 0))
+        if args.class_conditioning
+        else None,
     ).to(device)
     unet.train()
     ema = None if args.disable_ema else EMAModel(unet, decay=args.ema_decay)
@@ -273,6 +287,11 @@ def main() -> None:
         print("Training on deterministic VAE posterior modes")
     if args.class_conditioning:
         print(f"Class conditioning enabled for labels: {', '.join(CLASS_NAMES)}")
+        if args.class_dropout_prob > 0:
+            print(
+                "Classifier-free guidance training enabled: "
+                f"class_dropout_prob={args.class_dropout_prob}, null_label={NULL_CLASS_LABEL}"
+            )
     if args.architecture_preset != "custom":
         print(f"Architecture preset: {args.architecture_preset}")
 
@@ -308,6 +327,13 @@ def main() -> None:
             if args.class_conditioning:
                 pixel_values, class_labels = batch
                 class_labels = class_labels.to(device, non_blocking=True)
+                if args.class_dropout_prob > 0:
+                    drop_mask = torch.rand(class_labels.shape, device=device) < args.class_dropout_prob
+                    class_labels = torch.where(
+                        drop_mask,
+                        torch.full_like(class_labels, NULL_CLASS_LABEL),
+                        class_labels,
+                    )
             else:
                 pixel_values = batch
                 class_labels = None
