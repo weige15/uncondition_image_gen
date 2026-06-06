@@ -9,7 +9,7 @@ __pycache__/
 .venv/
 venv/
 env/
-
+*.pdf
 # Local secrets and machine-specific files
 .env
 .env.*
